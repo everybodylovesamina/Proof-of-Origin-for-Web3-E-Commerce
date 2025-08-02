@@ -3,6 +3,8 @@
 (define-constant err-not-found (err u101))
 (define-constant err-already-exists (err u102))
 (define-constant err-not-authorized (err u103))
+(define-constant err-invalid-signature (err u104))
+(define-constant err-challenge-expired (err u105))
 
 (define-non-fungible-token product uint)
 
@@ -36,6 +38,27 @@
 )
 
 (define-data-var product-counter uint u0)
+
+(define-map authentication-challenges
+    uint
+    {
+        challenge-hash: (buff 32),
+        expiry-block: uint,
+        issuer: principal
+    }
+)
+
+(define-map authentication-results
+    uint
+    (list 20 {
+        verifier: principal,
+        timestamp: uint,
+        challenge-id: uint,
+        verified: bool
+    })
+)
+
+(define-data-var challenge-counter uint u0)
 
 (define-public (register-manufacturer (name (string-ascii 50)))
     (let
@@ -137,4 +160,68 @@
 
 (define-private (is-owner (product-id uint) (user principal))
     (is-eq user (unwrap! (nft-get-owner? product product-id) false))
+)
+
+(define-public (create-authentication-challenge (product-id uint) (challenge-hash (buff 32)))
+    (let
+        ((challenge-id (+ (var-get challenge-counter) u1))
+         (product-data (unwrap! (map-get? product-details product-id) err-not-found)))
+        
+        (asserts! (is-eq tx-sender (get manufacturer product-data)) err-not-authorized)
+        
+        (map-set authentication-challenges challenge-id
+            {
+                challenge-hash: challenge-hash,
+                expiry-block: (+ burn-block-height u144),
+                issuer: tx-sender
+            }
+        )
+        
+        (var-set challenge-counter challenge-id)
+        (ok challenge-id)
+    )
+)
+
+(define-public (verify-product-authenticity (product-id uint) (challenge-id uint) (signature (buff 65)) (public-key (buff 33)))
+    (let
+        ((challenge-data (unwrap! (map-get? authentication-challenges challenge-id) err-not-found))
+         (product-data (unwrap! (map-get? product-details product-id) err-not-found))
+         (verifier tx-sender)
+         (current-results (default-to (list) (map-get? authentication-results product-id))))
+        
+        (asserts! (< burn-block-height (get expiry-block challenge-data)) err-challenge-expired)
+        (asserts! (is-eq (get issuer challenge-data) (get manufacturer product-data)) err-not-authorized)
+        
+        (let ((signature-valid (secp256k1-verify 
+                (get challenge-hash challenge-data)
+                signature
+                public-key)))
+            
+            (asserts! signature-valid err-invalid-signature)
+            
+            (map-set authentication-results product-id
+                (unwrap-panic (as-max-len?
+                    (append current-results
+                        {
+                            verifier: verifier,
+                            timestamp: burn-block-height,
+                            challenge-id: challenge-id,
+                            verified: true
+                        }
+                    ) u20)))
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-authentication-challenge (challenge-id uint))
+    (map-get? authentication-challenges challenge-id)
+)
+
+(define-read-only (get-authentication-results (product-id uint))
+    (map-get? authentication-results product-id)
+)
+
+(define-read-only (get-challenge-counter)
+    (var-get challenge-counter)
 )
