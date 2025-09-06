@@ -5,6 +5,7 @@
 (define-constant err-not-authorized (err u103))
 (define-constant err-invalid-signature (err u104))
 (define-constant err-challenge-expired (err u105))
+(define-constant err-product-recalled (err u106))
 
 (define-non-fungible-token product uint)
 
@@ -59,6 +60,25 @@
 )
 
 (define-data-var challenge-counter uint u0)
+
+(define-map product-recalls
+    uint
+    {
+        reason: (string-ascii 100),
+        recalled-by: principal,
+        recall-timestamp: uint,
+        is-emergency: bool
+    }
+)
+
+(define-map recall-notifications
+    uint
+    (list 50 {
+        notified-party: principal,
+        notification-timestamp: uint,
+        acknowledged: bool
+    })
+)
 
 (define-public (register-manufacturer (name (string-ascii 50)))
     (let
@@ -143,6 +163,7 @@
          (history (unwrap! (map-get? product-history product-id) err-not-found)))
         
         (asserts! (is-owner product-id sender) err-not-authorized)
+        (asserts! (is-none (map-get? product-recalls product-id)) err-product-recalled)
         (try! (nft-transfer? product product-id sender recipient))
         
         (map-set product-history product-id
@@ -224,4 +245,70 @@
 
 (define-read-only (get-challenge-counter)
     (var-get challenge-counter)
+)
+
+(define-public (recall-product (product-id uint) (reason (string-ascii 100)))
+    (let
+        ((product-data (unwrap! (map-get? product-details product-id) err-not-found))
+         (caller tx-sender))
+        
+        (asserts! (or 
+            (is-eq caller (get manufacturer product-data))
+            (is-eq caller contract-owner)) err-not-authorized)
+        (asserts! (is-none (map-get? product-recalls product-id)) err-already-exists)
+        
+        (map-set product-recalls product-id
+            {
+                reason: reason,
+                recalled-by: caller,
+                recall-timestamp: burn-block-height,
+                is-emergency: (is-eq caller contract-owner)
+            }
+        )
+        
+        (let ((current-history (unwrap! (map-get? product-history product-id) err-not-found)))
+            (map-set product-history product-id
+                (unwrap-panic (as-max-len? 
+                    (append current-history
+                        {
+                            action: "recalled",
+                            timestamp: burn-block-height,
+                            actor: caller
+                        }
+                    ) u10)))
+        )
+        (ok true)
+    )
+)
+
+(define-public (acknowledge-recall-notification (product-id uint))
+    (let
+        ((current-notifications (default-to (list) (map-get? recall-notifications product-id)))
+         (caller tx-sender))
+        
+        (asserts! (is-some (map-get? product-recalls product-id)) err-not-found)
+        
+        (map-set recall-notifications product-id
+            (unwrap-panic (as-max-len?
+                (append current-notifications
+                    {
+                        notified-party: caller,
+                        notification-timestamp: burn-block-height,
+                        acknowledged: true
+                    }
+                ) u50)))
+        (ok true)
+    )
+)
+
+(define-read-only (get-product-recall-status (product-id uint))
+    (map-get? product-recalls product-id)
+)
+
+(define-read-only (get-recall-notifications (product-id uint))
+    (map-get? recall-notifications product-id)
+)
+
+(define-read-only (is-product-recalled (product-id uint))
+    (is-some (map-get? product-recalls product-id))
 )
