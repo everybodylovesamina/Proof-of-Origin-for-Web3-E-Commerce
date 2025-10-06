@@ -80,6 +80,19 @@
     })
 )
 
+(define-map warranty-details
+    uint
+    {
+        warranty-period-blocks: uint,
+        start-time: uint,
+        claims: (list 10 {
+            claimer: principal,
+            claim-time: uint,
+            reason: (string-ascii 50)
+        })
+    }
+)
+
 (define-public (register-manufacturer (name (string-ascii 50)))
     (let
         ((manufacturer tx-sender))
@@ -106,16 +119,16 @@
     )
 )
 
-(define-public (register-product (name (string-ascii 50)) (serial (string-ascii 64)))
+(define-public (register-product (name (string-ascii 50)) (serial (string-ascii 64)) (warranty-period-blocks uint))
     (let
         ((manufacturer tx-sender)
          (product-id (+ (var-get product-counter) u1))
          (manufacturer-data (unwrap! (map-get? manufacturer-registry manufacturer) err-not-found)))
-        
+
         (asserts! (get verified manufacturer-data) err-not-authorized)
-        
+
         (try! (nft-mint? product product-id manufacturer))
-        
+
         (map-set product-details product-id
             {
                 manufacturer: manufacturer,
@@ -125,21 +138,32 @@
                 verified: true
             }
         )
-        
+
         (map-set manufacturer-registry
             manufacturer
-            (merge manufacturer-data 
+            (merge manufacturer-data
                 { products-registered: (+ (get products-registered manufacturer-data) u1) }))
-        
+
         (map-set product-history product-id
-            (list 
+            (list
                 {
                     action: "registered",
                     timestamp: burn-block-height,
                     actor: manufacturer
                 }
             ))
-        
+
+        (if (> warranty-period-blocks u0)
+            (map-set warranty-details product-id
+                {
+                    warranty-period-blocks: warranty-period-blocks,
+                    start-time: burn-block-height,
+                    claims: (list)
+                }
+            )
+            true
+        )
+
         (var-set product-counter product-id)
         (ok product-id)
     )
@@ -311,4 +335,50 @@
 
 (define-read-only (is-product-recalled (product-id uint))
     (is-some (map-get? product-recalls product-id))
+)
+
+(define-public (claim-warranty (product-id uint) (reason (string-ascii 50)))
+    (let
+        ((warranty-data (unwrap! (map-get? warranty-details product-id) err-not-found))
+         (claimer tx-sender)
+         (current-claims (get claims warranty-data)))
+
+        (asserts! (is-owner product-id claimer) err-not-authorized)
+        (asserts! (< burn-block-height (+ (get start-time warranty-data) (get warranty-period-blocks warranty-data))) err-not-authorized)
+
+        (map-set warranty-details product-id
+            (merge warranty-data
+                { claims: (unwrap-panic (as-max-len?
+                    (append current-claims
+                        {
+                            claimer: claimer,
+                            claim-time: burn-block-height,
+                            reason: reason
+                        }
+                    ) u10)) }))
+
+        (let ((current-history (unwrap! (map-get? product-history product-id) err-not-found)))
+            (map-set product-history product-id
+                (unwrap-panic (as-max-len?
+                    (append current-history
+                        {
+                            action: "warranty-claimed",
+                            timestamp: burn-block-height,
+                            actor: claimer
+                        }
+                    ) u10))))
+
+        (ok true)
+    )
+)
+
+(define-read-only (get-warranty-details (product-id uint))
+    (map-get? warranty-details product-id)
+)
+
+(define-read-only (is-warranty-valid (product-id uint))
+    (match (map-get? warranty-details product-id)
+        warranty-data (< burn-block-height (+ (get start-time warranty-data) (get warranty-period-blocks warranty-data)))
+        false
+    )
 )
