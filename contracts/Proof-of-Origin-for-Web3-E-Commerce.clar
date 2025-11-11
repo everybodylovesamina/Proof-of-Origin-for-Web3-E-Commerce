@@ -1,0 +1,421 @@
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-found (err u101))
+(define-constant err-already-exists (err u102))
+(define-constant err-not-authorized (err u103))
+(define-constant err-invalid-signature (err u104))
+(define-constant err-challenge-expired (err u105))
+(define-constant err-product-recalled (err u106))
+
+(define-non-fungible-token product uint)
+
+(define-map product-details
+    uint 
+    {
+        manufacturer: principal,
+        name: (string-ascii 50),
+        serial: (string-ascii 64),
+        timestamp: uint,
+        verified: bool
+    }
+)
+
+(define-map manufacturer-registry
+    principal 
+    {
+        name: (string-ascii 50),
+        verified: bool,
+        products-registered: uint
+    }
+)
+
+(define-map product-history
+    uint
+    (list 10 {
+        action: (string-ascii 20),
+        timestamp: uint,
+        actor: principal
+    })
+)
+
+(define-data-var product-counter uint u0)
+
+(define-map authentication-challenges
+    uint
+    {
+        challenge-hash: (buff 32),
+        expiry-block: uint,
+        issuer: principal
+    }
+)
+
+(define-map authentication-results
+    uint
+    (list 20 {
+        verifier: principal,
+        timestamp: uint,
+        challenge-id: uint,
+        verified: bool
+    })
+)
+
+(define-data-var challenge-counter uint u0)
+
+(define-map product-recalls
+    uint
+    {
+        reason: (string-ascii 100),
+        recalled-by: principal,
+        recall-timestamp: uint,
+        is-emergency: bool
+    }
+)
+
+(define-map recall-notifications
+    uint
+    (list 50 {
+        notified-party: principal,
+        notification-timestamp: uint,
+        acknowledged: bool
+    })
+)
+
+(define-map warranty-details
+    uint
+    {
+        warranty-period-blocks: uint,
+        start-time: uint,
+        claims: (list 10 {
+            claimer: principal,
+            claim-time: uint,
+            reason: (string-ascii 50)
+        })
+    }
+)
+
+(define-map product-reviews
+    uint
+    (list 20 {
+        reviewer: principal,
+        rating: uint,
+        comment: (string-ascii 100),
+        timestamp: uint
+    })
+)
+
+(define-public (register-manufacturer (name (string-ascii 50)))
+    (let
+        ((manufacturer tx-sender))
+        (asserts! (is-none (map-get? manufacturer-registry manufacturer)) err-already-exists)
+        (ok (map-set manufacturer-registry 
+            manufacturer
+            {
+                name: name,
+                verified: false,
+                products-registered: u0
+            }
+        ))
+    )
+)
+
+(define-public (verify-manufacturer (manufacturer principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-some (map-get? manufacturer-registry manufacturer)) err-not-found)
+        (ok (map-set manufacturer-registry
+            manufacturer
+            (merge (unwrap-panic (map-get? manufacturer-registry manufacturer))
+                { verified: true })))
+    )
+)
+
+(define-public (register-product (name (string-ascii 50)) (serial (string-ascii 64)) (warranty-period-blocks uint))
+    (let
+        ((manufacturer tx-sender)
+         (product-id (+ (var-get product-counter) u1))
+         (manufacturer-data (unwrap! (map-get? manufacturer-registry manufacturer) err-not-found)))
+
+        (asserts! (get verified manufacturer-data) err-not-authorized)
+
+        (try! (nft-mint? product product-id manufacturer))
+
+        (map-set product-details product-id
+            {
+                manufacturer: manufacturer,
+                name: name,
+                serial: serial,
+                timestamp: burn-block-height,
+                verified: true
+            }
+        )
+
+        (map-set manufacturer-registry
+            manufacturer
+            (merge manufacturer-data
+                { products-registered: (+ (get products-registered manufacturer-data) u1) }))
+
+        (map-set product-history product-id
+            (list
+                {
+                    action: "registered",
+                    timestamp: burn-block-height,
+                    actor: manufacturer
+                }
+            ))
+
+        (if (> warranty-period-blocks u0)
+            (map-set warranty-details product-id
+                {
+                    warranty-period-blocks: warranty-period-blocks,
+                    start-time: burn-block-height,
+                    claims: (list)
+                }
+            )
+            true
+        )
+
+        (var-set product-counter product-id)
+        (ok product-id)
+    )
+)
+
+(define-read-only (get-product-details (product-id uint))
+    (map-get? product-details product-id)
+)
+
+(define-read-only (get-product-history (product-id uint))
+    (map-get? product-history product-id)
+)
+
+(define-read-only (get-manufacturer-details (manufacturer principal))
+    (map-get? manufacturer-registry manufacturer)
+)
+
+(define-public (transfer-product (product-id uint) (recipient principal))
+    (let
+        ((sender tx-sender)
+         (history (unwrap! (map-get? product-history product-id) err-not-found)))
+        
+        (asserts! (is-owner product-id sender) err-not-authorized)
+        (asserts! (is-none (map-get? product-recalls product-id)) err-product-recalled)
+        (try! (nft-transfer? product product-id sender recipient))
+        
+        (map-set product-history product-id
+            (unwrap-panic (as-max-len? 
+                (append history
+                    {
+                        action: "transferred",
+                        timestamp: burn-block-height,
+                        actor: sender
+                    }
+                ) u10)))
+        (ok true)
+    )
+)
+
+(define-private (is-owner (product-id uint) (user principal))
+    (is-eq user (unwrap! (nft-get-owner? product product-id) false))
+)
+
+(define-public (create-authentication-challenge (product-id uint) (challenge-hash (buff 32)))
+    (let
+        ((challenge-id (+ (var-get challenge-counter) u1))
+         (product-data (unwrap! (map-get? product-details product-id) err-not-found)))
+        
+        (asserts! (is-eq tx-sender (get manufacturer product-data)) err-not-authorized)
+        
+        (map-set authentication-challenges challenge-id
+            {
+                challenge-hash: challenge-hash,
+                expiry-block: (+ burn-block-height u144),
+                issuer: tx-sender
+            }
+        )
+        
+        (var-set challenge-counter challenge-id)
+        (ok challenge-id)
+    )
+)
+
+(define-public (verify-product-authenticity (product-id uint) (challenge-id uint) (signature (buff 65)) (public-key (buff 33)))
+    (let
+        ((challenge-data (unwrap! (map-get? authentication-challenges challenge-id) err-not-found))
+         (product-data (unwrap! (map-get? product-details product-id) err-not-found))
+         (verifier tx-sender)
+         (current-results (default-to (list) (map-get? authentication-results product-id))))
+        
+        (asserts! (< burn-block-height (get expiry-block challenge-data)) err-challenge-expired)
+        (asserts! (is-eq (get issuer challenge-data) (get manufacturer product-data)) err-not-authorized)
+        
+        (let ((signature-valid (secp256k1-verify 
+                (get challenge-hash challenge-data)
+                signature
+                public-key)))
+            
+            (asserts! signature-valid err-invalid-signature)
+            
+            (map-set authentication-results product-id
+                (unwrap-panic (as-max-len?
+                    (append current-results
+                        {
+                            verifier: verifier,
+                            timestamp: burn-block-height,
+                            challenge-id: challenge-id,
+                            verified: true
+                        }
+                    ) u20)))
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-authentication-challenge (challenge-id uint))
+    (map-get? authentication-challenges challenge-id)
+)
+
+(define-read-only (get-authentication-results (product-id uint))
+    (map-get? authentication-results product-id)
+)
+
+(define-read-only (get-challenge-counter)
+    (var-get challenge-counter)
+)
+
+(define-public (recall-product (product-id uint) (reason (string-ascii 100)))
+    (let
+        ((product-data (unwrap! (map-get? product-details product-id) err-not-found))
+         (caller tx-sender))
+        
+        (asserts! (or 
+            (is-eq caller (get manufacturer product-data))
+            (is-eq caller contract-owner)) err-not-authorized)
+        (asserts! (is-none (map-get? product-recalls product-id)) err-already-exists)
+        
+        (map-set product-recalls product-id
+            {
+                reason: reason,
+                recalled-by: caller,
+                recall-timestamp: burn-block-height,
+                is-emergency: (is-eq caller contract-owner)
+            }
+        )
+        
+        (let ((current-history (unwrap! (map-get? product-history product-id) err-not-found)))
+            (map-set product-history product-id
+                (unwrap-panic (as-max-len? 
+                    (append current-history
+                        {
+                            action: "recalled",
+                            timestamp: burn-block-height,
+                            actor: caller
+                        }
+                    ) u10)))
+        )
+        (ok true)
+    )
+)
+
+(define-public (acknowledge-recall-notification (product-id uint))
+    (let
+        ((current-notifications (default-to (list) (map-get? recall-notifications product-id)))
+         (caller tx-sender))
+        
+        (asserts! (is-some (map-get? product-recalls product-id)) err-not-found)
+        
+        (map-set recall-notifications product-id
+            (unwrap-panic (as-max-len?
+                (append current-notifications
+                    {
+                        notified-party: caller,
+                        notification-timestamp: burn-block-height,
+                        acknowledged: true
+                    }
+                ) u50)))
+        (ok true)
+    )
+)
+
+(define-read-only (get-product-recall-status (product-id uint))
+    (map-get? product-recalls product-id)
+)
+
+(define-read-only (get-recall-notifications (product-id uint))
+    (map-get? recall-notifications product-id)
+)
+
+(define-read-only (is-product-recalled (product-id uint))
+    (is-some (map-get? product-recalls product-id))
+)
+
+(define-public (claim-warranty (product-id uint) (reason (string-ascii 50)))
+    (let
+        ((warranty-data (unwrap! (map-get? warranty-details product-id) err-not-found))
+         (claimer tx-sender)
+         (current-claims (get claims warranty-data)))
+
+        (asserts! (is-owner product-id claimer) err-not-authorized)
+        (asserts! (< burn-block-height (+ (get start-time warranty-data) (get warranty-period-blocks warranty-data))) err-not-authorized)
+
+        (map-set warranty-details product-id
+            (merge warranty-data
+                { claims: (unwrap-panic (as-max-len?
+                    (append current-claims
+                        {
+                            claimer: claimer,
+                            claim-time: burn-block-height,
+                            reason: reason
+                        }
+                    ) u10)) }))
+
+        (let ((current-history (unwrap! (map-get? product-history product-id) err-not-found)))
+            (map-set product-history product-id
+                (unwrap-panic (as-max-len?
+                    (append current-history
+                        {
+                            action: "warranty-claimed",
+                            timestamp: burn-block-height,
+                            actor: claimer
+                        }
+                    ) u10))))
+
+        (ok true)
+    )
+)
+
+(define-read-only (get-warranty-details (product-id uint))
+    (map-get? warranty-details product-id)
+)
+
+(define-read-only (is-warranty-valid (product-id uint))
+    (match (map-get? warranty-details product-id)
+        warranty-data (< burn-block-height (+ (get start-time warranty-data) (get warranty-period-blocks warranty-data)))
+        false
+    )
+)
+
+(define-public (submit-product-review (product-id uint) (rating uint) (comment (string-ascii 100)))
+    (let
+        ((reviewer tx-sender)
+         (current-reviews (default-to (list) (map-get? product-reviews product-id))))
+
+        (asserts! (is-some (map-get? product-details product-id)) err-not-found)
+        (asserts! (is-owner product-id reviewer) err-not-authorized)
+        (asserts! (and (>= rating u1) (<= rating u5)) err-not-authorized)
+
+        (map-set product-reviews product-id
+            (unwrap-panic (as-max-len?
+                (append current-reviews
+                    {
+                        reviewer: reviewer,
+                        rating: rating,
+                        comment: comment,
+                        timestamp: burn-block-height
+                    }
+                ) u20)))
+        (ok true)
+    )
+)
+
+(define-read-only (get-product-reviews (product-id uint))
+    (map-get? product-reviews product-id)
+)
