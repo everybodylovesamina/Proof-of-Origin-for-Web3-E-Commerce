@@ -93,6 +93,16 @@
     }
 )
 
+(define-map product-reviews
+    uint
+    (list 20 {
+        reviewer: principal,
+        rating: uint,
+        comment: (string-ascii 100),
+        timestamp: uint
+    })
+)
+
 (define-public (register-manufacturer (name (string-ascii 50)))
     (let
         ((manufacturer tx-sender))
@@ -381,4 +391,31 @@
         warranty-data (< burn-block-height (+ (get start-time warranty-data) (get warranty-period-blocks warranty-data)))
         false
     )
+)
+
+(define-public (submit-product-review (product-id uint) (rating uint) (comment (string-ascii 100)))
+    (let
+        ((reviewer tx-sender)
+         (current-reviews (default-to (list) (map-get? product-reviews product-id))))
+
+        (asserts! (is-some (map-get? product-details product-id)) err-not-found)
+        (asserts! (is-owner product-id reviewer) err-not-authorized)
+        (asserts! (and (>= rating u1) (<= rating u5)) err-not-authorized)
+
+        (map-set product-reviews product-id
+            (unwrap-panic (as-max-len?
+                (append current-reviews
+                    {
+                        reviewer: reviewer,
+                        rating: rating,
+                        comment: comment,
+                        timestamp: burn-block-height
+                    }
+                ) u20)))
+        (ok true)
+    )
+)
+
+(define-read-only (get-product-reviews (product-id uint))
+    (map-get? product-reviews product-id)
 )
